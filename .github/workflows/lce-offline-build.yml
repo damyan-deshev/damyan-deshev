@@ -1,0 +1,145 @@
+name: LCe offline build verification
+
+on:
+  push:
+    branches:
+      - lce-offline-build-20260926
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout validation control
+        uses: actions/checkout@v4
+        with:
+          path: control
+
+      - name: Verify overlay provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "a500d434022caaf23e3403cd0e49f3fbc66ad22fb50ab841874005c67c0e977e  control/lce-offline-overlay.tar.gz" | sha256sum -c -
+
+      - name: Checkout exact upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: davotoula/LightCompressor-enhanced
+          ref: 75c3e2fad04db154b4e3cdc5ca20e1f37b33dd46
+          path: src
+          fetch-depth: 1
+
+      - name: Apply offline overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C src rev-parse HEAD)" = "75c3e2fad04db154b4e3cdc5ca20e1f37b33dd46"
+          tar -xzf control/lce-offline-overlay.tar.gz -C src
+          while IFS= read -r f; do
+            [ -z "$f" ] || rm -f "src/$f"
+          done < src/DELETE.txt
+          rm -f src/DELETE.txt
+          git -C src diff --check
+          git -C src diff --binary > lce-offline.patch
+          sha256sum lce-offline.patch
+
+      - name: Prove call-home code is gone
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RInE --exclude='*.md' \
+            '(Firebase|Crashlytics|com\.google\.firebase|com\.google\.gms\.google-services|firebase-crashlytics|java\.net\.|okhttp|retrofit|ktor|WebSocket|Socket\()' \
+            src/app/src/main src/lightcompressor/src/main src/app/build.gradle src/build.gradle src/gradle/libs.versions.toml; then
+            echo "Forbidden network/telemetry reference found"
+            exit 1
+          fi
+          test ! -e src/app/google-services.json
+          test ! -e src/app/src/main/java/com/davotoula/lce/AnalyticsTracker.kt
+          grep -q 'android.permission.INTERNET' src/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.ACCESS_NETWORK_STATE' src/app/src/main/AndroidManifest.xml
+          grep -q 'tools:node="remove"' src/app/src/main/AndroidManifest.xml
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build, test and lint
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon assembleDebug testDebugUnitTest ktlintCheck detekt
+
+      - name: Audit resolved runtime dependencies
+        working-directory: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon :app:dependencies --configuration debugRuntimeClasspath > ../debug-runtime-dependencies.txt
+          if grep -Ei '(firebase|crashlytics)' ../debug-runtime-dependencies.txt; then
+            echo "Firebase/Crashlytics remains in runtime dependency graph"
+            exit 1
+          fi
+
+      - name: Audit merged manifest and APK permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          MANIFEST="$(find src/app/build/intermediates -type f -name AndroidManifest.xml \
+            \( -path '*merged_manifest*debug*' -o -path '*merged_manifests*debug*' \) | head -n 1)"
+          test -n "$MANIFEST"
+          cp "$MANIFEST" merged-AndroidManifest.xml
+
+          if grep -qE 'android\.permission\.(INTERNET|ACCESS_NETWORK_STATE)' "$MANIFEST"; then
+            echo "Network permission survived manifest merge: $MANIFEST"
+            grep -nE 'INTERNET|ACCESS_NETWORK_STATE' "$MANIFEST" || true
+            exit 1
+          fi
+
+          APK="$(find src/app/build/outputs/apk/debug -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          cp "$APK" LCe-offline-debug.apk
+
+          if command -v apkanalyzer >/dev/null 2>&1; then
+            apkanalyzer manifest permissions "$APK" | tee apk-permissions.txt
+          else
+            AAPT2="$(find "$ANDROID_HOME/build-tools" -type f -name aapt2 | sort -V | tail -n 1)"
+            test -x "$AAPT2"
+            "$AAPT2" dump permissions "$APK" | tee apk-permissions.txt
+          fi
+
+          if grep -qE 'android\.permission\.(INTERNET|ACCESS_NETWORK_STATE)' apk-permissions.txt; then
+            echo "Network permission present in built APK"
+            exit 1
+          fi
+
+          sha256sum "$APK" | tee apk-sha256.txt
+          strings "$APK" | grep -Ei '(firebase|crashlytics|google_app_id)' > apk-telemetry-strings.txt || true
+          if [ -s apk-telemetry-strings.txt ]; then
+            echo "Telemetry-related strings remain in APK"
+            cat apk-telemetry-strings.txt
+            exit 1
+          fi
+
+      - name: Upload validation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lce-offline-validation
+          if-no-files-found: error
+          path: |
+            LCe-offline-debug.apk
+            lce-offline.patch
+            merged-AndroidManifest.xml
+            apk-permissions.txt
+            apk-sha256.txt
+            apk-telemetry-strings.txt
+            debug-runtime-dependencies.txt
