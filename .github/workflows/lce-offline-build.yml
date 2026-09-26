@@ -19,11 +19,12 @@ jobs:
         with:
           path: control
 
-      - name: Verify overlay provenance
+      - name: Reconstruct and verify overlay provenance
         shell: bash
         run: |
           set -euo pipefail
-          echo "a500d434022caaf23e3403cd0e49f3fbc66ad22fb50ab841874005c67c0e977e  control/lce-offline-overlay.tar.gz" | sha256sum -c -
+          base64 --decode control/lce-offline-overlay.b64 > lce-offline-overlay.tar.gz
+          echo "a500d434022caaf23e3403cd0e49f3fbc66ad22fb50ab841874005c67c0e977e  lce-offline-overlay.tar.gz" | sha256sum -c -
 
       - name: Checkout exact upstream source
         uses: actions/checkout@v4
@@ -38,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git -C src rev-parse HEAD)" = "75c3e2fad04db154b4e3cdc5ca20e1f37b33dd46"
-          tar -xzf control/lce-offline-overlay.tar.gz -C src
+          tar -xzf lce-offline-overlay.tar.gz -C src
           while IFS= read -r f; do
             [ -z "$f" ] || rm -f "src/$f"
           done < src/DELETE.txt
